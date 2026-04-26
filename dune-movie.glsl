@@ -1,14 +1,71 @@
 // auto-generated; source: dune.png (equirectangular surface map)
-// ghostty custom shader: procedural 3D-rotating planet in the bottom-right
-// corner over a starry background with atmospheric halo.
+// ghostty custom shader: procedural 3D-rotating planet, starfield, gas streams,
+// atmospheric halo, and an animated ship sprite composited behind terminal text.
 
+// --- user-facing configuration ---------------------------------------------
+// SPIN_SPEED controls the planet's longitudinal rotation speed in radians per
+// second. Positive values rotate one way, negative values reverse direction,
+// and 0.0 freezes the surface. Practical range: min -0.25, max 0.25; values
+// outside that range tend to look jittery in a terminal-sized background.
+const float SPIN_SPEED      = 0.04375;
+
+// PLANET_W_FRAC is the width-based candidate for the planet radius:
+// iResolution.x * PLANET_W_FRAC. The final radius is the smaller of this and
+// the height-based candidate below, so increasing it may have no visible effect
+// once PLANET_H_FRAC becomes the limiter. Practical range: min 0.005, max 0.25;
+// 0.0 is invalid because it can make the radius zero.
+const float PLANET_W_FRAC   = 0.04333;
+
+// PLANET_H_FRAC is the height-based candidate for the planet radius:
+// iResolution.y * PLANET_H_FRAC. The final radius is min(width candidate,
+// height candidate). Practical range: min 0.005, max 0.25; lower values make
+// the planet cheaper but smaller, higher values increase screen coverage and
+// per-pixel work.
+const float PLANET_H_FRAC   = 0.06667;
+
+// BG_BRIGHTNESS multiplies the rendered background before terminal pixels are
+// composited over it. It affects planet, gas streams, stars, halo, and ship.
+// Practical range: min 0.0, max 1.0; values above 1.0 are allowed by GLSL but
+// can wash out text and will usually clamp in the final framebuffer.
+const float BG_BRIGHTNESS   = 0.6;
+
+// TEXT_LUM_LOW is the lower luminance threshold for terminal compositing.
+// Pixels at or below it are treated as terminal background, so the shader shows
+// through fully. Practical range: min 0.0, max TEXT_LUM_HIGH - 0.01; raise it
+// if your terminal background is not pure black and it dims the shader.
+const float TEXT_LUM_LOW    = 0.12;
+
+// TEXT_LUM_HIGH is the upper luminance threshold for terminal compositing.
+// Pixels at or above it are treated as solid terminal text and return early.
+// Values between TEXT_LUM_LOW and TEXT_LUM_HIGH blend smoothly for antialiasing.
+// Practical range: min TEXT_LUM_LOW + 0.01, max 1.0; lowering it protects more
+// text colors, raising it lets more shader show through dim syntax colors.
+const float TEXT_LUM_HIGH   = 0.25;
+
+// HALO_OUTER_SQ is the normalized squared radius cutoff for atmospheric halo
+// work. The planet edge is at r2 == 1.0; the current 2.25 means halo is computed
+// out to radius 1.5 in planet-radius units. Practical range: min 1.0, max 4.0;
+// lower cuts the halo sooner and is cheaper, higher restores more of the faint
+// exponential tail at increasing cost.
+const float HALO_OUTER_SQ   = 2.25000000;
+
+// --- embedded asset dimensions ---------------------------------------------
 const int TEX_W = 256;
 const int TEX_H = 128;
 const int SHIP_W = 160;
 const int SHIP_H = 68;
-const float SPIN_SPEED    = 0.04375;
-const float PLANET_W_FRAC = 0.04333;
-const float PLANET_H_FRAC = 0.06667;
+
+// Precomputed geometry, lighting, and reciprocal constants.
+const float SIN_A           = 0.31456656;
+const float COT_A           = 3.01759798;
+const float INV_SIN_A       = 3.17897744;
+const float RING_INNER_SQ   = 1.21000000;
+const float RING_OUTER_SQ   = 5.76000000;
+const float RING_INV_SPREAD_SQ = 2.36686391;
+const vec3  LIGHT_DIR       = vec3(-0.94881472, 0.09987523, 0.29962570);
+const float PHI_INV         = 0.6180339887;
+const float INV_2PI         = 0.15915494309;
+const float INV_PI          = 0.31830988618;
 
 const vec3 PALETTE[64] = vec3[64](
     vec3(0.92549, 0.61961, 0.24314),
@@ -1558,16 +1615,8 @@ float valueNoise(vec2 p) {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-// fractal brownian motion: different octave counts for different detail needs.
+// fractal brownian motion: fixed octave counts for different detail needs.
 // each unrolls to a straight-line sequence without a loop.
-float fbm5(vec2 p) {
-    float v  = 0.5    * valueNoise(p);            p = p * 2.03 + vec2(17.17, 7.13);
-          v += 0.25   * valueNoise(p);            p = p * 2.03 + vec2(17.17, 7.13);
-          v += 0.125  * valueNoise(p);            p = p * 2.03 + vec2(17.17, 7.13);
-          v += 0.0625 * valueNoise(p);            p = p * 2.03 + vec2(17.17, 7.13);
-          v += 0.03125 * valueNoise(p);
-    return v;
-}
 float fbm3(vec2 p) {
     float v  = 0.5   * valueNoise(p);             p = p * 2.03 + vec2(17.17, 7.13);
           v += 0.25  * valueNoise(p);             p = p * 2.03 + vec2(17.17, 7.13);
@@ -1620,52 +1669,16 @@ vec3 drawStars(vec2 fragCoord, float pxSize) {
     return tint * bright * tw * m;   // m provides the smooth gradient
 }
 
-// --- text detection thresholds --------------------------------------------
-// we can't ask ghostty "is this pixel text or terminal-background?", so we
-// approximate by luminance: anything darker than TEXT_LUM_LOW is treated as
-// pure background (our shader shows through), anything brighter than
-// TEXT_LUM_HIGH is treated as pure text (shown on top), values in between
-// smoothly blend. if your terminal bg isn't #000000 (e.g. #0a0a0a), raise
-// TEXT_LUM_LOW above its luminance so the bg doesn't dim our image.
-// ---------------------------------------------------------------------------
-const float TEXT_LUM_LOW  = 0.12;
-const float TEXT_LUM_HIGH = 0.25;
-
-// --- background brightness -------------------------------------------------
-// multiplier applied to everything we render (planet, ring, stars, ship)
-// *before* the terminal text is composited on top. lower -> darker backdrop,
-// easier-to-read text; higher -> brighter image, text starts to tunnel into it.
-//
-// valid range: >= 0.0 (no upper limit, but >1.0 pushes pixels past full bright
-// and Metal will clamp in the swapchain).
-//
-// useful values:
-//   0.00  -> pure black behind the text (shader effectively off visually)
-//   0.30  -> very dim, almost subliminal backdrop
-//   0.45  -> balanced, text very readable (our earlier default)
-//   0.70  -> image prominent but still legible
-//   0.80  -> current default, colors close to source
-//   1.00  -> full source brightness (may wash out dark syntax colors)
-//   >1.0  -> overbright / bloom-like, only useful if you have a very dark
-//           terminal theme and want the planet to pop
-// ---------------------------------------------------------------------------
-const float BG_BRIGHTNESS = 0.6;
-
-// precomputed ring/light constants (compile-time; no sin/cos/normalize at runtime)
-const float SIN_A           = 0.31456656;
-const float COT_A           = 3.01759798;
-const float INV_SIN_A       = 3.17897744;
-const float RING_INNER_SQ   = 1.21000000;
-const float RING_OUTER_SQ   = 5.76000000;
-const float RING_INV_SPREAD_SQ = 2.36686391;
-const vec3  LIGHT_DIR       = vec3(-0.94881472, 0.09987523, 0.29962570);
-const float PHI_INV         = 0.6180339887;
-const float INV_2PI         = 0.15915494309;
-const float INV_PI          = 0.31830988618;
-
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-    // -------- per-frame invariants (hoisted so they're computed once
-    // per warp, not per pixel; the Metal compiler can scalarize these) --
+    vec2 uv = fragCoord / iResolution.xy;
+    vec3 term = texture(iChannel0, uv).rgb;
+    float termLum = max(term.r, max(term.g, term.b));
+    if (termLum >= TEXT_LUM_HIGH) {
+        fragColor = vec4(term, 1.0);
+        return;
+    }
+
+    // -------- uniform-derived values reused throughout this fragment --------
     float pr     = min(iResolution.x * PLANET_W_FRAC,
                        iResolution.y * PLANET_H_FRAC);
     float invPr  = 1.0 / pr;
@@ -1694,18 +1707,20 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float r2 = dot(n, n);
 
     vec3 bg = vec3(0.0);
+    float sphereZ = 0.0;
 
     if (r2 < 1.0) {
         // -------- inside planet disc: 3D sphere rendering --------
         float z = sqrt(1.0 - r2);
+        sphereZ = z;
         vec3 normal = vec3(n.x, n.y, z);
 
-        // rotate around Y axis; trig hoisted above
+        // rotate around Y axis using the spin trig values computed above
         vec3 sp = vec3(normal.x * spinCos + normal.z * spinSin,
                        normal.y,
                        -normal.x * spinSin + normal.z * spinCos);
 
-        // equirectangular UV from sphere point (precomputed 1/pi)
+        // equirectangular UV from sphere point (using reciprocal constants)
         float lon = atan(sp.x, sp.z);
         float lat = asin(clamp(sp.y, -1.0, 1.0));
         vec3 base = sampleTex(vec2(lon * INV_2PI + 0.5,
@@ -1725,20 +1740,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         // -------- outside planet disc: stars + halo --------
         bg = drawStars(fragCoord, pxSize);
 
-        float d = sqrt(r2) - 1.0;
-        float halo = exp(-d * 14.0) * 0.55;
-        bg += vec3(0.12, 0.32, 0.85) * halo;
+        if (r2 < HALO_OUTER_SQ) {
+            float d = sqrt(r2) - 1.0;
+            float halo = exp(-d * 14.0) * 0.55;
+            bg += vec3(0.12, 0.32, 0.85) * halo;
+        }
     }
 
-    // -------- equatorial gas streams (early-out via squared distance) --------
-    // bbox: if n.x^2 or (n.y*invSinA)^2 exceed outer radius^2, skip entirely
+    // -------- equatorial gas streams (early-out via squared annular bounds) --
     float ryLocal = n.y * INV_SIN_A;
     float rRingSq = n.x * n.x + ryLocal * ryLocal;
     if (rRingSq >= RING_INNER_SQ && rRingSq <= RING_OUTER_SQ) {
         float zRing = n.y * COT_A;
         bool ringVisible = true;
         if (r2 < 1.0) {
-            if (zRing < sqrt(1.0 - r2)) ringVisible = false;
+            if (zRing < sphereZ) ringVisible = false;
         }
         if (ringVisible) {
             float rRing = sqrt(rRingSq);
@@ -1747,7 +1763,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             float dr = (rRing - 1.6);
             vec2 pCoarse = vec2(flow * 1.2, dr * 1.8);
             vec2 pFine   = vec2(flow * 4.5 - flowFine, dr * 5.0);
-            // coarse structure: 3 octaves suffice. fine detail: 4 octaves.
+            // coarse and fine structures both use 3-octave noise.
             float dens = fbm3(pCoarse) * 0.65 + fbm3(pFine) * 0.5;
             dens = max(0.0, dens - 0.35) * 1.6;
             dens = pow(dens, 1.35);
@@ -1793,10 +1809,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         if (max(sc.r, max(sc.g, sc.b)) > 0.08) bg = sc;
     }
 
-    // composite with terminal: dim the image, keep text legible.
-    vec2 uv = fragCoord / iResolution.xy;
-    vec3 term = texture(iChannel0, uv).rgb;
-    float termLum = max(term.r, max(term.g, term.b));
+    // Composite shader output behind background and antialiased text pixels.
     float textMask = smoothstep(TEXT_LUM_LOW, TEXT_LUM_HIGH, termLum);
     fragColor = vec4(mix(bg * BG_BRIGHTNESS, term, textMask), 1.0);
 }
