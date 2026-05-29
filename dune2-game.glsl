@@ -1649,12 +1649,15 @@ float starMask(vec2 d, float arm) {
 vec3 drawStars(vec2 fragCoord, float pxSize) {
     float cell = 9.0 * pxSize;
     vec2 id = floor(fragCoord / cell);
-    vec2 local = mod(fragCoord, cell);
 
     float h = hash21(id);
     if (h < 0.94375) return vec3(0.0);
 
-    vec2 cPx = floor(vec2(hash21(id + 17.0), hash21(id + 31.0)) * (cell / pxSize));
+    // local needed only past the early-out
+    vec2 local = mod(fragCoord, cell);
+
+    // cell / pxSize is exactly 9.0 by definition of cell above
+    vec2 cPx = floor(vec2(hash21(id + 17.0), hash21(id + 31.0)) * 9.0);
     vec2 c = (cPx + 0.5) * pxSize;
     vec2 d = (local - c) / pxSize;
 
@@ -1685,9 +1688,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float pxSize = max(2.0, floor(iResolution.y * 0.0045));
     vec2  center = iResolution.xy * PHI_INV;
 
-    float spinAngle = iTime * SPIN_SPEED;
-    float spinCos = cos(spinAngle);
-    float spinSin = sin(spinAngle);
     float flowPhase = iTime * 0.0109375;
     float flowFine  = iTime * 0.0625;
 
@@ -1715,7 +1715,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         sphereZ = z;
         vec3 normal = vec3(n.x, n.y, z);
 
-        // rotate around Y axis using the spin trig values computed above
+        // spin trig only needed inside the disc
+        float spinAngle = iTime * SPIN_SPEED;
+        float spinCos = cos(spinAngle);
+        float spinSin = sin(spinAngle);
+
+        // rotate around Y axis
         vec3 sp = vec3(normal.x * spinCos + normal.z * spinSin,
                        normal.y,
                        -normal.x * spinSin + normal.z * spinCos);
